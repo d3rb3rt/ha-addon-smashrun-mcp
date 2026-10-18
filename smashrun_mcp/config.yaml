@@ -1,0 +1,26 @@
+name: "Smashrun MCP"
+version: "0.1.2"
+slug: smashrun_mcp
+description: "MCP-Server für Smashrun-Laufdaten (Streamable HTTP)"
+url: "https://api.smashrun.com/v1/documentation"
+arch:
+  - amd64
+  - aarch64
+startup: application
+boot: auto
+watchdog: "http://[HOST]:[PORT:8099]/healthz"
+ports:
+  8099/tcp: 8099
+ports_description:
+  8099/tcp: "MCP-Endpunkt unter /<secret_path>/mcp, Health-Check unter /healthz"
+options:
+  access_token: ""
+  secret_path: ""
+  allow_write: true
+  allowed_cidrs: []
+schema:
+  access_token: password
+  secret_path: password
+  allow_write: bool
+  allowed_cidrs:
+    - "str?"
