@@ -9,17 +9,31 @@ Reine Standardbibliothek plus httpx. Läuft auch allein:  python3 geo.py LAUF.js
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import math
+import os
 import sys
+import time
+from pathlib import Path
 from typing import Any, Optional
 
 import httpx
+
+log = logging.getLogger("smashrun.geo")
 
 OVERPASS_URLS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
 ]
+# Der MCP-Client wartet nicht ewig: Gesamtfrist für alle Overpass-Versuche zusammen,
+# danach kommt die Antwort ohne Wegbeschreibung (mit route_error), aber mit Laufrichtung.
+OVERPASS_DEADLINE_S = float(os.environ.get("SMASHRUN_OVERPASS_DEADLINE", "25"))
+OVERPASS_QUERY_TIMEOUT_S = 15
+CACHE_TTL_S = 30 * 24 * 3600
+CACHE_FILE = Path(os.environ.get("SMASHRUN_GEO_CACHE", "/data/overpass_cache.json"))
+_mem_cache: dict[str, dict] = {}
 USER_AGENT = "smashrun-mcp/0.2 (private running coach; contact via Home Assistant owner)"
 EARTH_R = 6371000.0
 
@@ -72,6 +86,16 @@ def _project(lat: float, lon: float, lat0: float) -> tuple[float, float]:
 # --------------------------------------------------------------------------
 # Laufrichtung
 # --------------------------------------------------------------------------
+def _direction_confidence(kind: str, norm: float, gap: float) -> str:
+    """hoch: klare Schleife; mittel: schmale Schleife (z. B. Hausrunde, norm ca. 0,005);
+    niedrig: alles andere. Schwellen an echten Läufen kalibriert (24.10.2026: norm 0,0052)."""
+    if kind != "rundstrecke" or gap > 150:
+        return "niedrig"
+    if norm >= 0.005:
+        return "hoch"
+    return "mittel"
+
+
 def route_direction(pts: list[tuple[float, float, float]]) -> dict[str, Any]:
     """Richtung einer Rundstrecke. Positive Shoelace-Fläche = gegen den Uhrzeigersinn."""
     lat0 = sum(p[0] for p in pts) / len(pts)
@@ -96,7 +120,8 @@ def route_direction(pts: list[tuple[float, float, float]]) -> dict[str, Any]:
         "direction": direction,
         "start_end_gap_m": round(gap),
         "enclosed_area_m2": round(abs(area)),
-        "confidence": "hoch" if kind == "rundstrecke" and norm > 0.01 else "niedrig",
+        "normalized_area": round(norm, 4),
+        "confidence": _direction_confidence(kind, norm, gap),
     }
 
 
@@ -106,30 +131,81 @@ def route_direction(pts: list[tuple[float, float, float]]) -> dict[str, Any]:
 def build_query(south: float, west: float, north: float, east: float) -> str:
     bbox = f"{south:.5f},{west:.5f},{north:.5f},{east:.5f}"
     return (
-        "[out:json][timeout:30];("
-        f'way["highway"]({bbox});'
+        f"[out:json][timeout:{OVERPASS_QUERY_TIMEOUT_S}];("
+        f'way["highway"]["highway"!~"^(motorway|motorway_link|trunk|trunk_link|proposed|construction|'
+        f'raceway|bus_guideway|corridor|elevator)$"]({bbox});'
         f'way["leisure"="park"]({bbox});'
         ");out tags geom;"
     )
 
 
+def _cache_key(south: float, west: float, north: float, east: float) -> str:
+    raw = f"{south:.4f},{west:.4f},{north:.4f},{east:.4f}"
+    return hashlib.sha1(raw.encode()).hexdigest()[:16]
+
+
+def _cache_load() -> dict[str, Any]:
+    try:
+        return json.loads(CACHE_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _cache_get(key: str) -> Optional[dict]:
+    hit = _mem_cache.get(key)
+    if hit is None:
+        entry = _cache_load().get(key)
+        if entry and time.time() - entry.get("t", 0) < CACHE_TTL_S:
+            hit = entry["osm"]
+            _mem_cache[key] = hit
+    return hit
+
+
+def _cache_put(key: str, osm: dict) -> None:
+    _mem_cache[key] = osm
+    try:
+        data = _cache_load()
+        now = time.time()
+        data = {k: v for k, v in data.items() if now - v.get("t", 0) < CACHE_TTL_S}
+        data[key] = {"t": now, "osm": osm}
+        if CACHE_FILE.parent.is_dir():
+            CACHE_FILE.write_text(json.dumps(data))
+    except OSError as e:  # Cache ist optional
+        log.warning("Overpass-Cache nicht schreibbar: %s", e)
+
+
 def fetch_overpass(south: float, west: float, north: float, east: float) -> dict:
+    """OSM-Wege der Bounding-Box. Zuerst Cache, dann Overpass mit Gesamtfrist."""
+    key = _cache_key(south, west, north, east)
+    cached = _cache_get(key)
+    if cached is not None:
+        log.info("Overpass-Cache-Treffer (%s)", key)
+        return {**cached, "_cached": True}
     query = build_query(south, west, north, east)
+    deadline = time.monotonic() + OVERPASS_DEADLINE_S
     last: Optional[Exception] = None
     for url in OVERPASS_URLS:
+        remaining = deadline - time.monotonic()
+        if remaining < 3:
+            break
+        t0 = time.monotonic()
         try:
             resp = httpx.post(
                 url,
                 data={"data": query},
                 headers={"User-Agent": USER_AGENT},
-                timeout=httpx.Timeout(40.0, connect=10.0),
+                timeout=httpx.Timeout(min(remaining, 20.0), connect=5.0),
             )
+            log.info("Overpass %s: HTTP %s nach %.1f s", url, resp.status_code, time.monotonic() - t0)
             if resp.status_code == 200:
-                return resp.json()
+                osm = resp.json()
+                _cache_put(key, osm)
+                return osm
             last = RuntimeError(f"{url}: HTTP {resp.status_code}")
         except httpx.HTTPError as e:
+            log.warning("Overpass %s: %s nach %.1f s", url, type(e).__name__, time.monotonic() - t0)
             last = e
-    raise RuntimeError(f"Overpass nicht erreichbar ({last}).")
+    raise RuntimeError(f"Overpass nicht erreichbar oder zu langsam ({last}).")
 
 
 def _seg_dist(px: float, py: float, ax: float, ay: float, bx: float, by: float) -> float:
@@ -267,12 +343,21 @@ def describe_route(run: dict, fetch=fetch_overpass) -> dict[str, Any]:
     north = max(p[0] for p in pts) + pad
     west = min(p[1] for p in pts) - pad
     east = max(p[1] for p in pts) + pad
+    t0 = time.monotonic()
     try:
         osm = fetch(south, west, north, east)
     except RuntimeError as e:
         res["route_error"] = str(e)
+        res["timing_s"] = {"overpass": round(time.monotonic() - t0, 1)}
         return res
+    t1 = time.monotonic()
+    cached = bool(osm.pop("_cached", False))
     res.update(match_route(pts, osm))
+    res["timing_s"] = {
+        "overpass": round(t1 - t0, 1),
+        "matching": round(time.monotonic() - t1, 1),
+        "from_cache": cached,
+    }
     res["source"] = "OpenStreetMap-Mitwirkende (ODbL), Abfrage per Overpass-API"
     res["note"] = "Höhen liefert OSM nicht. Belag nur, wo er in OSM eingetragen ist."
     return res

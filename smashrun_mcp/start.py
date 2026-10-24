@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Startskript der Home-Assistant-App: liest die App-Optionen und startet den HTTP-Server."""
 import json
+import logging
 import os
 import sys
 
@@ -8,6 +9,7 @@ OPTIONS_FILE = os.environ.get("OPTIONS_FILE", "/data/options.json")
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     try:
         with open(OPTIONS_FILE, encoding="utf-8") as f:
             opts = json.load(f)
