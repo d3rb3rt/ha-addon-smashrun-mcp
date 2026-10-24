@@ -331,11 +331,12 @@ async def describe_route(activity_id: int) -> Any:
     """Beschreibt die Strecke eines Laufs mit OpenStreetMap-Daten (rein lesend).
 
     Liefert die Laufrichtung (Uhrzeigersinn oder dagegen) und die Abschnitte der Strecke mit
-    km-Bereich, Wegname, Wegtyp (Fußweg, Radweg, Straße ...), Belag (wo in OSM eingetragen),
-    Brücke und Park. Ordnet dazu die GPS-Spur per Overpass-API den OSM-Wegen zu (ein Aufruf
-    für die ganze Strecke, danach aus dem Cache). Höhen liefert OSM nicht. Ist Overpass nicht
-    erreichbar oder nach ca. 25 s nicht fertig, kommt trotzdem die Laufrichtung zurück, plus
-    eine Fehlermeldung unter route_error. timing_s zeigt, wo die Zeit hinging.
+    km-Bereich, Wegname, Wegtyp (Fußweg, Radweg, Straße ...), Belag und Brücke. Die GPS-Spur
+    wird per Valhalla-Map-Matching (öffentlicher FOSSGIS-Server, ein Aufruf pro Lauf, danach
+    aus dem Cache) auf das Wegenetz gelegt. Ist Valhalla nicht erreichbar, folgt Overpass als
+    Ausweichlösung. Klappt beides nicht innerhalb von ca. 15 s, kommt trotzdem die Laufrichtung
+    zurück, plus eine Fehlermeldung unter route_error. timing_s zeigt, wo die Zeit hinging.
+    Keine Parkflächen und keine Höhen.
     """
     return await asyncio.to_thread(_describe_route_sync, activity_id)
 

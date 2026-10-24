@@ -2,8 +2,8 @@
 
 - route_direction(): Richtung einer Rundstrecke (Uhrzeigersinn / dagegen) aus der GPS-Spur,
   reine Geometrie (Shoelace-Formel), kein Netzwerkzugriff.
-- describe_route(): ordnet die Spur per Overpass-API (OpenStreetMap) Wegen zu und liefert
-  Abschnitte mit Namen, Wegtyp, Belag und km-Bereich. Höhen liefert OSM nicht.
+- describe_route(): ordnet die Spur per Valhalla-Map-Matching (OpenStreetMap-Daten) Wegen zu,
+  Ausweichlösung Overpass-API. Liefert Abschnitte mit Namen, Wegtyp, Belag und km-Bereich.
 
 Reine Standardbibliothek plus httpx. Läuft auch allein:  python3 geo.py LAUF.json
 """
@@ -27,9 +27,16 @@ OVERPASS_URLS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
 ]
-# Der MCP-Client wartet nicht ewig: Gesamtfrist für alle Overpass-Versuche zusammen,
-# danach kommt die Antwort ohne Wegbeschreibung (mit route_error), aber mit Laufrichtung.
-OVERPASS_DEADLINE_S = float(os.environ.get("SMASHRUN_OVERPASS_DEADLINE", "25"))
+# Der MCP-Client wartet nicht ewig (0.2.1: trotz 25 s Frist Timeout beim Client). Deshalb
+# gilt eine Frist je Quelle: erst Valhalla (Map-Matching), danach Overpass als Ausweichlösung.
+# Zusammen höchstens ca. 15 s, danach kommt die Antwort ohne Wegbeschreibung (mit
+# route_error), aber mit Laufrichtung.
+VALHALLA_URL = os.environ.get("SMASHRUN_VALHALLA_URL", "https://valhalla1.openstreetmap.de/trace_attributes")
+VALHALLA_DEADLINE_S = float(os.environ.get("SMASHRUN_VALHALLA_DEADLINE", "8"))
+# Kurz halten: ein langer X-Client-Id-Wert hat beim Demo-Server schon Nginx zum Absturz gebracht.
+VALHALLA_CLIENT_ID = "smashrun-mcp-ha"
+VALHALLA_STEP_M = 15.0  # Spur vor dem Senden auf einen Punkt alle 15 m ausdünnen
+OVERPASS_DEADLINE_S = float(os.environ.get("SMASHRUN_OVERPASS_DEADLINE", "7"))
 OVERPASS_QUERY_TIMEOUT_S = 15
 CACHE_TTL_S = 30 * 24 * 3600
 CACHE_FILE = Path(os.environ.get("SMASHRUN_GEO_CACHE", "/data/overpass_cache.json"))
@@ -208,6 +215,164 @@ def fetch_overpass(south: float, west: float, north: float, east: float) -> dict
     raise RuntimeError(f"Overpass nicht erreichbar oder zu langsam ({last}).")
 
 
+# --------------------------------------------------------------------------
+# Valhalla (Map-Matching): legt die Spur auf das Wegenetz und liefert Wege mit Namen,
+# Wegtyp und Belag direkt zurück. Öffentlicher Demo-Server von FOSSGIS: fair use,
+# 1 Anfrage/s, daher ein Aufruf pro Lauf und Ergebnis im Cache.
+# --------------------------------------------------------------------------
+USE_DE = {
+    "footway": "Fußweg",
+    "sidewalk": "Gehweg",
+    "path": "Pfad",
+    "cycleway": "Radweg",
+    "mountain_bike": "Radweg",
+    "track": "Feldweg",
+    "pedestrian": "Fußgängerzone",
+    "pedestrian_crossing": "Querung",
+    "living_street": "verkehrsberuhigte Straße",
+    "service_road": "Zufahrt",
+    "driveway": "Zufahrt",
+    "alley": "Gasse",
+    "road": "Straße",
+    "steps": "Treppe",
+    "bridleway": "Reitweg",
+    "rest_area": "Rastplatz",
+}
+
+
+def sample_shape(pts: list[tuple[float, float, float]], step_m: float = VALHALLA_STEP_M) -> list[dict]:
+    """Punkte für Valhalla: erster, letzter und je einer alle step_m Meter."""
+    out, next_d = [], 0.0
+    for lat, lon, d in pts:
+        if d >= next_d:
+            out.append({"lat": round(lat, 6), "lon": round(lon, 6)})
+            next_d = d + step_m
+    last = {"lat": round(pts[-1][0], 6), "lon": round(pts[-1][1], 6)}
+    if out[-1] != last:
+        out.append(last)
+    return out
+
+
+def fetch_valhalla(shape: list[dict]) -> dict:
+    """trace_attributes beim Valhalla-Server. Zuerst Cache, sonst ein Aufruf mit Frist."""
+    key = "v" + hashlib.sha1(json.dumps(shape, separators=(",", ":")).encode()).hexdigest()[:15]
+    cached = _cache_get(key)
+    if cached is not None:
+        log.info("Valhalla-Cache-Treffer (%s)", key)
+        return {**cached, "_cached": True}
+    body = {
+        "shape": shape,
+        "costing": "pedestrian",
+        "shape_match": "map_snap",
+        "trace_options": {"search_radius": 30, "gps_accuracy": 10},
+        "filters": {
+            "attributes": [
+                "edge.names", "edge.length", "edge.surface", "edge.use", "edge.road_class",
+                "edge.bridge", "edge.tunnel",
+            ],
+            "action": "include",
+        },
+    }
+    t0 = time.monotonic()
+    try:
+        resp = httpx.post(
+            VALHALLA_URL,
+            json=body,
+            headers={"User-Agent": USER_AGENT, "X-Client-Id": VALHALLA_CLIENT_ID},
+            timeout=httpx.Timeout(VALHALLA_DEADLINE_S, connect=4.0),
+        )
+    except httpx.HTTPError as e:
+        log.warning("Valhalla: %s nach %.1f s", type(e).__name__, time.monotonic() - t0)
+        raise RuntimeError(f"Valhalla nicht erreichbar oder zu langsam ({type(e).__name__}).")
+    log.info("Valhalla %s: HTTP %s nach %.1f s", VALHALLA_URL, resp.status_code, time.monotonic() - t0)
+    if resp.status_code != 200:
+        detail = ""
+        try:
+            detail = str(resp.json().get("error", ""))[:120]
+        except ValueError:
+            pass
+        raise RuntimeError(f"Valhalla: HTTP {resp.status_code} {detail}".strip())
+    try:
+        data = resp.json()
+    except ValueError:
+        raise RuntimeError("Valhalla: Antwort ist kein JSON.")
+    if not data.get("edges"):
+        raise RuntimeError("Valhalla: keine Wege zur Spur gefunden.")
+    slim = {"edges": data["edges"]}  # nur das Nötige in den Cache
+    _cache_put(key, slim)
+    return slim
+
+
+def match_valhalla(pts: list[tuple[float, float, float]], vresp: dict) -> dict[str, Any]:
+    """Valhalla-Kanten zu Abschnitten mit km-Bereich (auf die aufgezeichnete Strecke skaliert)."""
+    edges = []
+    for e in vresp.get("edges", []):
+        length_m = float(e.get("length") or 0.0) * 1000.0  # Valhalla liefert km
+        if length_m <= 0:
+            continue
+        names = e.get("names") or []
+        use = e.get("use") or ""
+        kind = USE_DE.get(use, use or "Weg")
+        label = names[0] if names else f"{kind} ohne Namen"
+        edges.append(
+            {
+                "label": label, "type": kind, "length_m": length_m,
+                "surface": e.get("surface"), "bridge": bool(e.get("bridge")),
+            }
+        )
+    if not edges:
+        raise RuntimeError("Valhalla: keine auswertbaren Wege.")
+    matched_total = sum(e["length_m"] for e in edges)
+    total = pts[-1][2]
+    scale = total / matched_total if matched_total else 1.0
+
+    # Gleiche Bezeichnung in Folge zusammenfassen, sehr kurze Kanten (< 30 m) dem vorigen zuschlagen.
+    groups: list[dict[str, Any]] = []
+    for e in edges:
+        if groups and (groups[-1]["label"] == e["label"] or e["length_m"] < 30):
+            groups[-1]["edges"].append(e)
+        else:
+            groups.append({"label": e["label"], "edges": [e]})
+
+    out, surface_m, pos = [], {"befestigt": 0.0, "unbefestigt": 0.0, "unbekannt": 0.0}, 0.0
+    for g in groups:
+        length = sum(e["length_m"] for e in g["edges"]) * scale
+        # Typ und Belag nach dem längsten Anteil der Kanten bestimmen
+        by_type: dict[str, float] = {}
+        by_surf: dict[Optional[str], float] = {}
+        for e in g["edges"]:
+            by_type[e["type"]] = by_type.get(e["type"], 0.0) + e["length_m"]
+            by_surf[e["surface"]] = by_surf.get(e["surface"], 0.0) + e["length_m"]
+        kind_de = max(by_type, key=by_type.get)
+        surface = max(by_surf, key=by_surf.get)
+        if surface and surface.startswith("paved"):
+            sclass = "befestigt"
+        elif surface:
+            sclass = "unbefestigt"
+        else:
+            sclass = "unbekannt"
+        surface_m[sclass] += length
+        bridge_m = sum(e["length_m"] for e in g["edges"] if e["bridge"])
+        out.append(
+            {
+                "from_km": round(pos / 1000, 2),
+                "to_km": round((pos + length) / 1000, 2),
+                "length_m": round(length),
+                "name": g["label"],
+                "type": kind_de,
+                "surface": surface,
+                "bridge": "yes" if bridge_m >= 20 else None,
+                "park": None,  # Valhalla liefert keine Parkflächen
+            }
+        )
+        pos += length
+    return {
+        "stretches": out,
+        "surface_share_pct": {k: round(100 * v / total) for k, v in surface_m.items()} if total else {},
+        "matched_vs_recorded": round(matched_total / total, 2) if total else None,
+    }
+
+
 def _seg_dist(px: float, py: float, ax: float, ay: float, bx: float, by: float) -> float:
     dx, dy = bx - ax, by - ay
     if dx == 0 and dy == 0:
@@ -334,10 +499,29 @@ def match_route(
     }
 
 
-def describe_route(run: dict, fetch=fetch_overpass) -> dict[str, Any]:
-    """Richtung plus Streckenbeschreibung eines Laufs. fetch ist für Tests austauschbar."""
+def describe_route(run: dict, fetch=fetch_overpass, valhalla=fetch_valhalla) -> dict[str, Any]:
+    """Richtung plus Streckenbeschreibung eines Laufs. fetch/valhalla sind für Tests austauschbar.
+
+    Erst Valhalla (Map-Matching), bei Fehler oder Zeitüberschreitung Overpass als Ausweichlösung.
+    """
     pts = track_from_activity(run)
     res: dict[str, Any] = {"direction": route_direction(pts)}
+    v_error = None
+    t_v = time.monotonic()
+    try:
+        vresp = valhalla(sample_shape(pts))
+        v_cached = bool(vresp.pop("_cached", False))
+        res.update(match_valhalla(pts, vresp))
+        res["timing_s"] = {"valhalla": round(time.monotonic() - t_v, 1), "from_cache": v_cached}
+        res["source"] = "OpenStreetMap-Mitwirkende (ODbL), Map-Matching über Valhalla (FOSSGIS-Demo-Server)"
+        res["note"] = (
+            "Belag nach Valhalla (teils aus dem Wegtyp abgeleitet). Keine Parkflächen, keine Höhen."
+        )
+        return res
+    except RuntimeError as e:
+        v_error = str(e)
+        log.warning("Valhalla ohne Ergebnis, weiter mit Overpass: %s", v_error)
+    res["valhalla_error"] = v_error
     pad = 0.0006  # ca. 65 m Rand um die Spur
     south = min(p[0] for p in pts) - pad
     north = max(p[0] for p in pts) + pad
@@ -347,13 +531,17 @@ def describe_route(run: dict, fetch=fetch_overpass) -> dict[str, Any]:
     try:
         osm = fetch(south, west, north, east)
     except RuntimeError as e:
-        res["route_error"] = str(e)
-        res["timing_s"] = {"overpass": round(time.monotonic() - t0, 1)}
+        res["route_error"] = f"{v_error.rstrip('.')}; Overpass: {e}"
+        res["timing_s"] = {
+            "valhalla": round(t0 - t_v, 1),
+            "overpass": round(time.monotonic() - t0, 1),
+        }
         return res
     t1 = time.monotonic()
     cached = bool(osm.pop("_cached", False))
     res.update(match_route(pts, osm))
     res["timing_s"] = {
+        "valhalla": round(t0 - t_v, 1),
         "overpass": round(t1 - t0, 1),
         "matching": round(time.monotonic() - t1, 1),
         "from_cache": cached,
