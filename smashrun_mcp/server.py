@@ -29,10 +29,11 @@ import httpx
 
 import analysis  # lokale Auswertung der Zeitreihen (analysis.py)
 import geo  # Laufrichtung und OSM-Streckenbeschreibung (geo.py)
+import maps  # Kartenbild und Höhenprofil (maps.py)
 try:  # MCP SDK 2.x
-    from mcp.server.mcpserver import MCPServer as _Server
+    from mcp.server.mcpserver import Image, MCPServer as _Server
 except ImportError:  # MCP SDK 1.x
-    from mcp.server.fastmcp import FastMCP as _Server
+    from mcp.server.fastmcp import FastMCP as _Server, Image
 
 API = "https://api.smashrun.com/v1"
 TOKEN_URL = "https://secure.smashrun.com/oauth2/token"
@@ -339,6 +340,87 @@ async def describe_route(activity_id: int) -> Any:
     Keine Parkflächen und keine Höhen.
     """
     return await asyncio.to_thread(_describe_route_sync, activity_id)
+
+
+def _render_route_map_sync(activity_id: int, highlight_sprints: bool, size: int) -> list:
+    run = _get(f"/my/activities/{int(activity_id)}")
+    if not isinstance(run, dict):
+        return [json.dumps(run, ensure_ascii=False)]
+    try:
+        pts = geo.track_from_activity(run)
+    except ValueError as e:
+        raise SmashrunError(str(e))
+    efforts: list[dict] = []
+    if highlight_sprints:
+        try:
+            efforts = analysis.analyze_activity_json(run).get("efforts", [])
+        except ValueError:
+            efforts = []
+    try:
+        png, meta = maps.render_map(pts, efforts=efforts, size=size)
+    except RuntimeError as e:
+        raise SmashrunError(str(e))
+    direction = geo.route_direction(pts)
+    info = {
+        "activityId": int(activity_id),
+        "startDateTimeLocal": run.get("startDateTimeLocal"),
+        "distance_km": round(pts[-1][2] / 1000, 2),
+        "direction": direction.get("direction"),
+        "sprints": [
+            {"nr": n, "km": e["km"], "len_m": e["len_m"], "pace": e["pace"]}
+            for n, e in enumerate(efforts, start=1)
+        ],
+        "map": meta,
+        "legend": "blau = Spur, rot = Antritte (nummeriert), Zahlen im Kreis = km-Marken, grün = Start, rot = Ziel",
+        "source": f"{maps.ATTRIBUTION} (ODbL), Kartenkacheln tile.openstreetmap.org",
+    }
+    return [json.dumps(info, ensure_ascii=False), Image(data=png, format="png")]
+
+
+@mcp.tool()
+async def render_route_map(activity_id: int, highlight_sprints: bool = True, size: int = 800) -> list:
+    """Zeichnet die GPS-Spur eines Laufs als Kartenbild (PNG, OpenStreetMap-Kacheln).
+
+    Start grün, Ziel rot, km-Marken als Zahlen im Kreis. Mit highlight_sprints=True werden die
+    Antritte aus analyze_activity rot und nummeriert eingezeichnet; die Textantwort nennt sie
+    mit Start-km, Länge und Pace. size: Kantenlänge in Pixel (400-1200, Standard 800).
+    Rein lesend, ein Smashrun-Aufruf. Die Kacheln werden zwischengespeichert."""
+    return await asyncio.to_thread(_render_route_map_sync, activity_id, highlight_sprints, size)
+
+
+def _elevation_profile_sync(activity_id: int, chart: bool) -> list:
+    run = _get(f"/my/activities/{int(activity_id)}")
+    if not isinstance(run, dict):
+        return [json.dumps(run, ensure_ascii=False)]
+    try:
+        pts = geo.track_from_activity(run)
+        res = maps.elevation_profile(pts, with_chart=chart)
+    except ValueError as e:
+        raise SmashrunError(str(e))
+    except RuntimeError as e:
+        raise SmashrunError(str(e))
+    png = res.pop("_chart", None)
+    recorded = run.get("elevationGain") or run.get("elevationGained")
+    res["activityId"] = int(activity_id)
+    res["startDateTimeLocal"] = run.get("startDateTimeLocal")
+    if recorded is not None:
+        res["recorded_by_watch"] = recorded
+        res["note"] = "recorded_by_watch ist der Wert der Uhr (Smashrun), meist unzuverlässig."
+    out: list = [json.dumps(res, ensure_ascii=False)]
+    if png:
+        out.append(Image(data=png, format="png"))
+    return out
+
+
+@mcp.tool()
+async def get_elevation_profile(activity_id: int, chart: bool = False) -> list:
+    """Höhenprofil eines Laufs aus einem Geländemodell (Open-Meteo), nicht aus der Uhr.
+
+    Liefert Anstieg und Abstieg gesamt, tiefsten und höchsten Punkt (mit km), Start- und
+    Endhöhe und die Höhe je Kilometer. chart=True hängt eine kleine Grafik an. Das Modell hat
+    ein Raster von etwa 90 m und ist deshalb grob; für flache Strecken zählt vor allem der
+    Vergleich zwischen Läufen. Rein lesend, ein Smashrun-Aufruf, Ergebnis im Cache."""
+    return await asyncio.to_thread(_elevation_profile_sync, activity_id, chart)
 
 
 @mcp.tool()

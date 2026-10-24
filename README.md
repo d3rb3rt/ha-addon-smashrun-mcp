@@ -1,6 +1,6 @@
 # Smashrun MCP (Home-Assistant-App)
 
-MCP-Server für Smashrun-Laufdaten (Streamable HTTP) als Home-Assistant-App. Liest und schreibt Läufe, Notizen und Gewicht und wertet Läufe sekundengenau aus (`analyze_activity`).
+MCP-Server für Smashrun-Laufdaten (Streamable HTTP) als Home-Assistant-App. Liest und schreibt Läufe, Notizen und Gewicht und wertet Läufe sekundengenau aus (`analyze_activity`), beschreibt Strecken (`describe_route`), zeichnet Kartenbilder (`render_route_map`) und liefert Höhenprofile (`get_elevation_profile`).
 
 ## Installation
 
