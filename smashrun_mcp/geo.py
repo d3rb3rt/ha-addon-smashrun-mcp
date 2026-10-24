@@ -1,0 +1,283 @@
+"""GPS-Auswertung eines Smashrun-Laufs: Laufrichtung und Streckenbeschreibung mit OSM-Daten.
+
+- route_direction(): Richtung einer Rundstrecke (Uhrzeigersinn / dagegen) aus der GPS-Spur,
+  reine Geometrie (Shoelace-Formel), kein Netzwerkzugriff.
+- describe_route(): ordnet die Spur per Overpass-API (OpenStreetMap) Wegen zu und liefert
+  Abschnitte mit Namen, Wegtyp, Belag und km-Bereich. Höhen liefert OSM nicht.
+
+Reine Standardbibliothek plus httpx. Läuft auch allein:  python3 geo.py LAUF.json
+"""
+from __future__ import annotations
+
+import json
+import math
+import sys
+from typing import Any, Optional
+
+import httpx
+
+OVERPASS_URLS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+]
+USER_AGENT = "smashrun-mcp/0.2 (private running coach; contact via Home Assistant owner)"
+EARTH_R = 6371000.0
+
+HIGHWAY_DE = {
+    "footway": "Fußweg",
+    "path": "Pfad",
+    "cycleway": "Radweg",
+    "track": "Feldweg",
+    "pedestrian": "Fußgängerzone",
+    "service": "Zufahrt",
+    "residential": "Wohnstraße",
+    "living_street": "verkehrsberuhigte Straße",
+    "tertiary": "Straße",
+    "secondary": "Straße",
+    "primary": "Straße",
+    "unclassified": "Straße",
+    "steps": "Treppe",
+}
+PAVED = {"asphalt", "paved", "concrete", "paving_stones", "sett", "concrete:plates", "bricks"}
+
+
+# --------------------------------------------------------------------------
+# Zeitreihen lesen
+# --------------------------------------------------------------------------
+def track_from_activity(run: dict) -> list[tuple[float, float, float]]:
+    """(lat, lon, distanz_m) je Aufzeichnungspunkt. Punkte ohne GPS werden übersprungen."""
+    keys, vals = run.get("recordingKeys"), run.get("recordingValues")
+    if not keys or not vals:
+        raise ValueError("Lauf enthält keine Zeitreihen (recordingValues).")
+    col = {k: vals[i] for i, k in enumerate(keys)}
+    if not {"latitude", "longitude", "distance"} <= set(col):
+        raise ValueError("Zeitreihen ohne GPS (latitude/longitude/distance).")
+    pts = []
+    for la, lo, d in zip(col["latitude"], col["longitude"], col["distance"]):
+        if la is None or lo is None or (la == 0 and lo == 0):
+            continue
+        pts.append((float(la), float(lo), float(d) * 1000.0))
+    if len(pts) < 10:
+        raise ValueError("Zu wenige GPS-Punkte für eine Auswertung.")
+    return pts
+
+
+def _project(lat: float, lon: float, lat0: float) -> tuple[float, float]:
+    """Lokale Näherung in Metern (x nach Osten, y nach Norden)."""
+    x = math.radians(lon) * EARTH_R * math.cos(math.radians(lat0))
+    y = math.radians(lat) * EARTH_R
+    return x, y
+
+
+# --------------------------------------------------------------------------
+# Laufrichtung
+# --------------------------------------------------------------------------
+def route_direction(pts: list[tuple[float, float, float]]) -> dict[str, Any]:
+    """Richtung einer Rundstrecke. Positive Shoelace-Fläche = gegen den Uhrzeigersinn."""
+    lat0 = sum(p[0] for p in pts) / len(pts)
+    xy = [_project(p[0], p[1], lat0) for p in pts]
+    gap = math.dist(xy[0], xy[-1])
+    area = 0.0
+    for (x1, y1), (x2, y2) in zip(xy, xy[1:] + xy[:1]):
+        area += x1 * y2 - x2 * y1
+    area /= 2.0
+    length = pts[-1][2] or 1.0
+    # Normierte Fläche: Kreis = 1/(4*pi) = 0.08, Hin-und-zurück-Strecke ~ 0.
+    norm = abs(area) / (length * length)
+    if gap > 250:
+        kind, direction = "offen", None
+    elif norm < 0.004:
+        kind, direction = "hin_und_zurueck", None
+    else:
+        kind = "rundstrecke"
+        direction = "gegen den Uhrzeigersinn" if area > 0 else "im Uhrzeigersinn"
+    return {
+        "kind": kind,
+        "direction": direction,
+        "start_end_gap_m": round(gap),
+        "enclosed_area_m2": round(abs(area)),
+        "confidence": "hoch" if kind == "rundstrecke" and norm > 0.01 else "niedrig",
+    }
+
+
+# --------------------------------------------------------------------------
+# Overpass
+# --------------------------------------------------------------------------
+def build_query(south: float, west: float, north: float, east: float) -> str:
+    bbox = f"{south:.5f},{west:.5f},{north:.5f},{east:.5f}"
+    return (
+        "[out:json][timeout:30];("
+        f'way["highway"]({bbox});'
+        f'way["leisure"="park"]({bbox});'
+        ");out tags geom;"
+    )
+
+
+def fetch_overpass(south: float, west: float, north: float, east: float) -> dict:
+    query = build_query(south, west, north, east)
+    last: Optional[Exception] = None
+    for url in OVERPASS_URLS:
+        try:
+            resp = httpx.post(
+                url,
+                data={"data": query},
+                headers={"User-Agent": USER_AGENT},
+                timeout=httpx.Timeout(40.0, connect=10.0),
+            )
+            if resp.status_code == 200:
+                return resp.json()
+            last = RuntimeError(f"{url}: HTTP {resp.status_code}")
+        except httpx.HTTPError as e:
+            last = e
+    raise RuntimeError(f"Overpass nicht erreichbar ({last}).")
+
+
+def _seg_dist(px: float, py: float, ax: float, ay: float, bx: float, by: float) -> float:
+    dx, dy = bx - ax, by - ay
+    if dx == 0 and dy == 0:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)))
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+
+def _in_polygon(px: float, py: float, poly: list[tuple[float, float]]) -> bool:
+    inside = False
+    j = len(poly) - 1
+    for i in range(len(poly)):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        if (yi > py) != (yj > py) and px < (xj - xi) * (py - yi) / (yj - yi) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def _label(tags: dict) -> str:
+    name = tags.get("name") or tags.get("ref")
+    kind = HIGHWAY_DE.get(tags.get("highway", ""), tags.get("highway", "Weg"))
+    return name if name else f"{kind} ohne Namen"
+
+
+def match_route(
+    pts: list[tuple[float, float, float]], osm: dict, max_dist_m: float = 25.0, step_m: float = 25.0
+) -> dict[str, Any]:
+    """Ordnet die Spur den OSM-Wegen zu und fasst sie zu Abschnitten zusammen."""
+    lat0 = sum(p[0] for p in pts) / len(pts)
+    ways, parks = [], []
+    for el in osm.get("elements", []):
+        geom = el.get("geometry") or []
+        if el.get("type") != "way" or len(geom) < 2:
+            continue
+        xy = [_project(g["lat"], g["lon"], lat0) for g in geom]
+        tags = el.get("tags", {})
+        if "highway" in tags:
+            ways.append((tags, xy))
+        elif tags.get("leisure") == "park" and xy[0] == xy[-1]:
+            parks.append((tags.get("name", "Park ohne Namen"), xy))
+
+    # Spur gleichmäßig alle step_m Meter abtasten.
+    samples, next_d = [], 0.0
+    for lat, lon, d in pts:
+        if d >= next_d:
+            samples.append((d, _project(lat, lon, lat0)))
+            next_d = d + step_m
+
+    labelled = []
+    for d, (px, py) in samples:
+        best, best_dist = None, max_dist_m
+        for tags, xy in ways:
+            for a, b in zip(xy, xy[1:]):
+                dist = _seg_dist(px, py, a[0], a[1], b[0], b[1])
+                if dist < best_dist:
+                    best, best_dist = tags, dist
+        park = next((n for n, poly in parks if _in_polygon(px, py, poly)), None)
+        if best is None:
+            labelled.append((d, "kein Weg in OSM gefunden", {}, park))
+        else:
+            labelled.append((d, _label(best), best, park))
+
+    # Gleiche Namen in Folge zu Abschnitten verbinden.
+    stretches: list[dict[str, Any]] = []
+    for d, label, tags, park in labelled:
+        if stretches and stretches[-1]["name"] == label:
+            stretches[-1]["to_m"] = d
+            stretches[-1]["_parks"].append(park)
+            stretches[-1]["_tags"].append(tags)
+        else:
+            stretches.append({"name": label, "from_m": d, "to_m": d, "_parks": [park], "_tags": [tags]})
+
+    # Sehr kurze Abschnitte (< 60 m) dem vorigen zuschlagen, damit GPS-Rauschen nicht stückelt.
+    merged: list[dict[str, Any]] = []
+    for s in stretches:
+        if merged and (s["to_m"] - s["from_m"]) < 60:
+            merged[-1]["to_m"] = s["to_m"]
+            merged[-1]["_parks"] += s["_parks"]
+            merged[-1]["_tags"] += s["_tags"]
+        elif merged and merged[-1]["name"] == s["name"]:
+            merged[-1]["to_m"] = s["to_m"]
+            merged[-1]["_parks"] += s["_parks"]
+            merged[-1]["_tags"] += s["_tags"]
+        else:
+            merged.append(s)
+
+    out, surface_m = [], {"befestigt": 0.0, "unbefestigt": 0.0, "unbekannt": 0.0}
+    total = pts[-1][2]
+    for i, s in enumerate(merged):
+        end = merged[i + 1]["from_m"] if i + 1 < len(merged) else total
+        start = 0.0 if i == 0 else s["from_m"]
+        length = max(0.0, end - start)
+        tags = max(s["_tags"], key=lambda t: len(t)) if s["_tags"] else {}
+        surface = tags.get("surface")
+        if surface in PAVED:
+            kind = "befestigt"
+        elif surface:
+            kind = "unbefestigt"
+        else:
+            kind = "unbekannt"
+        surface_m[kind] += length
+        parks_seen = [p for p in s["_parks"] if p]
+        park = max(set(parks_seen), key=parks_seen.count) if parks_seen else None
+        if park and parks_seen.count(park) * 2 <= len(s["_parks"]):
+            park = None  # nur wenn die Mehrheit des Abschnitts im Park liegt
+        out.append(
+            {
+                "from_km": round(start / 1000, 2),
+                "to_km": round(end / 1000, 2),
+                "length_m": round(length),
+                "name": s["name"],
+                "type": HIGHWAY_DE.get(tags.get("highway", ""), tags.get("highway")),
+                "surface": surface,
+                "bridge": tags.get("bridge") or None,
+                "park": park,
+            }
+        )
+    return {
+        "stretches": out,
+        "surface_share_pct": {k: round(100 * v / total) for k, v in surface_m.items()} if total else {},
+        "ways_in_osm": len(ways),
+    }
+
+
+def describe_route(run: dict, fetch=fetch_overpass) -> dict[str, Any]:
+    """Richtung plus Streckenbeschreibung eines Laufs. fetch ist für Tests austauschbar."""
+    pts = track_from_activity(run)
+    res: dict[str, Any] = {"direction": route_direction(pts)}
+    pad = 0.0006  # ca. 65 m Rand um die Spur
+    south = min(p[0] for p in pts) - pad
+    north = max(p[0] for p in pts) + pad
+    west = min(p[1] for p in pts) - pad
+    east = max(p[1] for p in pts) + pad
+    try:
+        osm = fetch(south, west, north, east)
+    except RuntimeError as e:
+        res["route_error"] = str(e)
+        return res
+    res.update(match_route(pts, osm))
+    res["source"] = "OpenStreetMap-Mitwirkende (ODbL), Abfrage per Overpass-API"
+    res["note"] = "Höhen liefert OSM nicht. Belag nur, wo er in OSM eingetragen ist."
+    return res
+
+
+if __name__ == "__main__":
+    with open(sys.argv[1]) as f:
+        print(json.dumps(describe_route(json.load(f)), indent=2, ensure_ascii=False))

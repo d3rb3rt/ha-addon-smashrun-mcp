@@ -27,6 +27,7 @@ from typing import Any, Literal, Optional
 import httpx
 
 import analysis  # lokale Auswertung der Zeitreihen (analysis.py)
+import geo  # Laufrichtung und OSM-Streckenbeschreibung (geo.py)
 try:  # MCP SDK 2.x
     from mcp.server.mcpserver import MCPServer as _Server
 except ImportError:  # MCP SDK 1.x
@@ -300,6 +301,32 @@ def analyze_activity(
         res = analysis.analyze_activity_json(
             run, thr_pace=effort_threshold_pace, window_s=max(4, min(int(window_s), 60))
         )
+    except ValueError as e:
+        raise SmashrunError(str(e))
+    res["activityId"] = int(activity_id)
+    res["startDateTimeLocal"] = run.get("startDateTimeLocal")
+    try:  # Laufrichtung aus der GPS-Spur, rein geometrisch, ohne Netzwerk
+        res["route_direction"] = geo.route_direction(geo.track_from_activity(run))
+    except ValueError:
+        res["route_direction"] = None
+    return res
+
+
+@mcp.tool()
+def describe_route(activity_id: int) -> Any:
+    """Beschreibt die Strecke eines Laufs mit OpenStreetMap-Daten (rein lesend).
+
+    Liefert die Laufrichtung (Uhrzeigersinn oder dagegen) und die Abschnitte der Strecke mit
+    km-Bereich, Wegname, Wegtyp (Fußweg, Radweg, Straße ...), Belag (wo in OSM eingetragen),
+    Brücke und Park. Ordnet dazu die GPS-Spur per Overpass-API den OSM-Wegen zu (ein Aufruf
+    für die ganze Strecke). Höhen liefert OSM nicht. Ist Overpass nicht erreichbar, kommt
+    trotzdem die Laufrichtung zurück, plus eine Fehlermeldung unter route_error.
+    """
+    run = _get(f"/my/activities/{int(activity_id)}")
+    if not isinstance(run, dict):
+        return run
+    try:
+        res = geo.describe_route(run)
     except ValueError as e:
         raise SmashrunError(str(e))
     res["activityId"] = int(activity_id)
