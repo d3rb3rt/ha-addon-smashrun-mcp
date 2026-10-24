@@ -55,10 +55,10 @@ def _world_px(lat: float, lon: float, z: int) -> tuple[float, float]:
     return x, y
 
 
-def _choose_zoom(pts: list[tuple[float, float, float]], max_w: int, max_h: int) -> int:
-    """Größter Zoom (höchstens 17), bei dem Spur samt Rand ins Bild passt und höchstens
+def _choose_zoom(pts: list[tuple[float, float, float]], max_w: int, max_h: int, max_zoom: int = 17) -> int:
+    """Größter Zoom (höchstens max_zoom), bei dem Spur samt Rand ins Bild passt und höchstens
     MAX_TILES Kacheln gebraucht werden."""
-    for z in range(17, 9, -1):
+    for z in range(max_zoom, 9, -1):
         xs, ys = zip(*(_world_px(la, lo, z) for la, lo, _ in pts))
         w, h = max(xs) - min(xs) + 80, max(ys) - min(ys) + 80
         if w <= max_w and h <= max_h:
@@ -115,14 +115,36 @@ def render_map(
     pts: list[tuple[float, float, float]],
     efforts: Optional[list[dict]] = None,
     size: int = 800,
+    km_from: Optional[float] = None,
+    km_to: Optional[float] = None,
 ) -> tuple[bytes, dict[str, Any]]:
-    """JPEG-Bytes (höchstens MAX_IMAGE_BYTES) plus Metadaten. efforts: Antritte aus analysis.analyze (km, len_m)."""
+    """JPEG-Bytes (höchstens MAX_IMAGE_BYTES) plus Metadaten. efforts: Antritte aus analysis.analyze (km, len_m).
+
+    km_from/km_to: nur dieses Stück der Strecke füllt das Bild (Zoom bis 18), der Rest der Spur
+    wird, soweit er im Ausschnitt liegt, mitgezeichnet."""
     from PIL import Image, ImageDraw, ImageFont  # Pillow erst hier, damit der Rest ohne läuft
 
     size = max(400, min(int(size), 1200))
-    z = _choose_zoom(pts, size, size)
+    total_m = pts[-1][2]
+    section = km_from is not None or km_to is not None
+    if section:
+        a_m = max(0.0, (km_from if km_from is not None else 0.0) * 1000)
+        b_m = min(total_m, (km_to if km_to is not None else total_m / 1000) * 1000)
+        if b_m - a_m < 50:
+            raise RuntimeError(
+                f"Ausschnitt zu kurz oder außerhalb der Strecke (Lauf hat {total_m / 1000:.2f} km, "
+                "mindestens 50 m nötig)."
+            )
+        focus = [p for p in pts if a_m <= p[2] <= b_m]
+        if len(focus) < 2:
+            raise RuntimeError("Im Ausschnitt liegen zu wenige GPS-Punkte.")
+        z = _choose_zoom(focus, size, size, max_zoom=18)
+    else:
+        focus = pts
+        z = _choose_zoom(pts, size, size)
     world = [_world_px(la, lo, z) for la, lo, _ in pts]
-    xs, ys = [p[0] for p in world], [p[1] for p in world]
+    fworld = [_world_px(la, lo, z) for la, lo, _ in focus]
+    xs, ys = [p[0] for p in fworld], [p[1] for p in fworld]
     cx, cy = (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
     left, top = cx - size / 2, cy - size / 2
     tx0, tx1 = math.floor(left / TILE), math.floor((left + size) / TILE)
@@ -143,6 +165,9 @@ def render_map(
     draw.line(xy, fill=(0, 90, 220, 255), width=5, joint="curve")
 
     meta: dict[str, Any] = {"zoom": z, "tiles": len(wanted), "size_px": size}
+    if section:
+        meta["km_from"] = round(a_m / 1000, 2)
+        meta["km_to"] = round(b_m / 1000, 2)
     total = pts[-1][2]
 
     def at_dist(d: float) -> int:
@@ -188,6 +213,8 @@ def render_map(
     draw.ellipse([x - 6, y - 6, x + 6, y + 6], fill=(30, 160, 60, 255), outline=(255, 255, 255, 255), width=2)
 
     label = f"{ATTRIBUTION}  ·  {total / 1000:.2f} km"
+    if section:
+        label += f"  ·  Ausschnitt km {a_m / 1000:.2f}-{b_m / 1000:.2f}"
     tw = draw.textlength(label, font=small)
     draw.rectangle([0, size - 20, tw + 12, size], fill=(255, 255, 255, 200))
     draw.text((6, size - 17), label, fill=(40, 40, 40, 255), font=small)

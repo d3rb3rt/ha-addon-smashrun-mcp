@@ -342,7 +342,8 @@ async def describe_route(activity_id: int) -> Any:
     return await asyncio.to_thread(_describe_route_sync, activity_id)
 
 
-def _render_route_map_sync(activity_id: int, highlight_sprints: bool, size: int) -> list:
+def _render_route_map_sync(activity_id: int, highlight_sprints: bool, size: int,
+                           km_from: Optional[float] = None, km_to: Optional[float] = None) -> list:
     run = _get(f"/my/activities/{int(activity_id)}")
     if not isinstance(run, dict):
         return [json.dumps(run, ensure_ascii=False)]
@@ -357,7 +358,7 @@ def _render_route_map_sync(activity_id: int, highlight_sprints: bool, size: int)
         except ValueError:
             efforts = []
     try:
-        png, meta = maps.render_map(pts, efforts=efforts, size=size)
+        png, meta = maps.render_map(pts, efforts=efforts, size=size, km_from=km_from, km_to=km_to)
     except RuntimeError as e:
         raise SmashrunError(str(e))
     direction = geo.route_direction(pts)
@@ -378,15 +379,21 @@ def _render_route_map_sync(activity_id: int, highlight_sprints: bool, size: int)
 
 
 @mcp.tool()
-async def render_route_map(activity_id: int, highlight_sprints: bool = True, size: int = 800) -> list:
+async def render_route_map(activity_id: int, highlight_sprints: bool = True, size: Optional[int] = None,
+                           km_from: Optional[float] = None, km_to: Optional[float] = None) -> list:
     """Zeichnet die GPS-Spur eines Laufs als Kartenbild (JPEG, OpenStreetMap-Kacheln).
 
     Start grün, Ziel rot, km-Marken als Zahlen im Kreis. Mit highlight_sprints=True werden die
     Antritte aus analyze_activity rot und nummeriert eingezeichnet; die Textantwort nennt sie
-    mit Start-km, Länge und Pace. size: Kantenlänge in Pixel (400-1200, Standard 800). Das Bild
-    wird auf ca. 24 KB komprimiert (Qualität, ggf. Größe sinken), sonst kürzt der Client die Antwort.
-    Rein lesend, ein Smashrun-Aufruf. Die Kacheln werden zwischengespeichert."""
-    return await asyncio.to_thread(_render_route_map_sync, activity_id, highlight_sprints, size)
+    mit Start-km, Länge und Pace. size: Kantenlänge in Pixel (400-1200, Standard 800, bei Ausschnitt 450).
+    km_from/km_to (in km, einer von beiden genügt): zeigt nur dieses Stück der Strecke groß, bis
+    Zoom 18 (zum Beispiel um einen Antritt oder eine Wende genau anzusehen). Ohne beide die ganze
+    Strecke. Das Bild wird auf ca. 24 KB komprimiert (Qualität, ggf. Größe sinken), sonst kürzt der
+    Client die Antwort. Rein lesend, ein Smashrun-Aufruf. Die Kacheln werden zwischengespeichert."""
+    section = km_from is not None or km_to is not None
+    if size is None:
+        size = 450 if section else 800
+    return await asyncio.to_thread(_render_route_map_sync, activity_id, highlight_sprints, size, km_from, km_to)
 
 
 def _elevation_profile_sync(activity_id: int, chart: bool) -> list:
