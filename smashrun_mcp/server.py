@@ -374,16 +374,17 @@ def _render_route_map_sync(activity_id: int, highlight_sprints: bool, size: int)
         "legend": "blau = Spur, rot = Antritte (nummeriert), Zahlen im Kreis = km-Marken, grün = Start, rot = Ziel",
         "source": f"{maps.ATTRIBUTION} (ODbL), Kartenkacheln tile.openstreetmap.org",
     }
-    return [json.dumps(info, ensure_ascii=False), Image(data=png, format="png")]
+    return [json.dumps(info, ensure_ascii=False), Image(data=png, format="jpeg")]
 
 
 @mcp.tool()
 async def render_route_map(activity_id: int, highlight_sprints: bool = True, size: int = 800) -> list:
-    """Zeichnet die GPS-Spur eines Laufs als Kartenbild (PNG, OpenStreetMap-Kacheln).
+    """Zeichnet die GPS-Spur eines Laufs als Kartenbild (JPEG, OpenStreetMap-Kacheln).
 
     Start grün, Ziel rot, km-Marken als Zahlen im Kreis. Mit highlight_sprints=True werden die
     Antritte aus analyze_activity rot und nummeriert eingezeichnet; die Textantwort nennt sie
-    mit Start-km, Länge und Pace. size: Kantenlänge in Pixel (400-1200, Standard 800).
+    mit Start-km, Länge und Pace. size: Kantenlänge in Pixel (400-1200, Standard 800). Das Bild
+    wird auf ca. 45 KB komprimiert (Qualität, ggf. Größe sinken), sonst kürzt der Client die Antwort.
     Rein lesend, ein Smashrun-Aufruf. Die Kacheln werden zwischengespeichert."""
     return await asyncio.to_thread(_render_route_map_sync, activity_id, highlight_sprints, size)
 

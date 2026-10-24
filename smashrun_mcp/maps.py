@@ -1,6 +1,6 @@
 """Kartenbild und Höhenprofil eines Smashrun-Laufs.
 
-- render_map(): zeichnet die GPS-Spur auf OSM-Kacheln (PNG), mit Start/Ziel, km-Marken und
+- render_map(): zeichnet die GPS-Spur auf OSM-Kacheln (JPEG, begrenzte Größe), mit Start/Ziel, km-Marken und
   optional den Antritten aus analysis.py.
 - elevation_profile(): Höhen aus dem Geländemodell von Open-Meteo (keine Schlüssel nötig),
   weil die Höhe der Uhr unzuverlässig ist. Liefert Anstieg/Abstieg, Extreme und Höhe je km.
@@ -36,6 +36,11 @@ ELEV_STEP_M = 50.0
 ELEV_BATCH = 100
 ELEV_TTL_S = 365 * 24 * 3600
 ATTRIBUTION = "© OpenStreetMap-Mitwirkende"
+# Obergrenze fürs Kartenbild. Der Client kürzt Tool-Antworten ab ca. 25.000 Token; ein Bild als
+# Base64 zählt mit. 0.3.0 lieferte PNG mit ca. 0,4-1,0 MB, das kam nie an. 45 KB JPEG = ca. 60.000
+# Base64-Zeichen.
+MAX_IMAGE_BYTES = int(os.environ.get("SMASHRUN_MAX_IMAGE_BYTES", "45000"))
+JPEG_QUALITIES = (82, 72, 62, 52, 42, 34)
 
 
 # --------------------------------------------------------------------------
@@ -110,7 +115,7 @@ def render_map(
     efforts: Optional[list[dict]] = None,
     size: int = 800,
 ) -> tuple[bytes, dict[str, Any]]:
-    """PNG-Bytes plus Metadaten. efforts: Antritte aus analysis.analyze (km, len_m)."""
+    """JPEG-Bytes (höchstens MAX_IMAGE_BYTES) plus Metadaten. efforts: Antritte aus analysis.analyze (km, len_m)."""
     from PIL import Image, ImageDraw, ImageFont  # Pillow erst hier, damit der Rest ohne läuft
 
     size = max(400, min(int(size), 1200))
@@ -186,9 +191,29 @@ def render_map(
     draw.rectangle([0, size - 20, tw + 12, size], fill=(255, 255, 255, 200))
     draw.text((6, size - 17), label, fill=(40, 40, 40, 255), font=small)
 
-    buf = io.BytesIO()
-    img.save(buf, format="PNG", optimize=True)
-    return buf.getvalue(), meta
+    data, enc = _encode_jpeg_limited(img, MAX_IMAGE_BYTES)
+    meta.update(enc)
+    return data, meta
+
+
+def _encode_jpeg_limited(img, max_bytes: int) -> tuple[bytes, dict[str, Any]]:
+    """JPEG, das höchstens max_bytes groß ist: erst Qualität senken, dann Bild verkleinern.
+    Rückgabe: (Bytes, Meta mit Qualität, Format, Pixelkante, Bytes)."""
+    from PIL import Image
+
+    cur = img
+    while True:
+        for q in JPEG_QUALITIES:
+            buf = io.BytesIO()
+            cur.save(buf, format="JPEG", quality=q, optimize=True, progressive=False)
+            if buf.tell() <= max_bytes:
+                return buf.getvalue(), {"format": "jpeg", "quality": q, "image_px": cur.width,
+                                        "bytes": buf.tell()}
+        if cur.width <= 320:  # nicht weiter verkleinern, bestmögliches Ergebnis liefern
+            return buf.getvalue(), {"format": "jpeg", "quality": q, "image_px": cur.width,
+                                    "bytes": buf.tell(), "over_limit": True}
+        nw = int(cur.width * 0.85)
+        cur = cur.resize((nw, int(cur.height * nw / cur.width)), Image.LANCZOS)
 
 
 # --------------------------------------------------------------------------
