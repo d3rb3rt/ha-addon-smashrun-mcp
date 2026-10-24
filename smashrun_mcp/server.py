@@ -14,6 +14,7 @@ Optional für automatische Erneuerung: SMASHRUN_CLIENT_ID + SMASHRUN_CLIENT_SECR
 """
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import os
@@ -312,16 +313,7 @@ def analyze_activity(
     return res
 
 
-@mcp.tool()
-def describe_route(activity_id: int) -> Any:
-    """Beschreibt die Strecke eines Laufs mit OpenStreetMap-Daten (rein lesend).
-
-    Liefert die Laufrichtung (Uhrzeigersinn oder dagegen) und die Abschnitte der Strecke mit
-    km-Bereich, Wegname, Wegtyp (Fußweg, Radweg, Straße ...), Belag (wo in OSM eingetragen),
-    Brücke und Park. Ordnet dazu die GPS-Spur per Overpass-API den OSM-Wegen zu (ein Aufruf
-    für die ganze Strecke). Höhen liefert OSM nicht. Ist Overpass nicht erreichbar, kommt
-    trotzdem die Laufrichtung zurück, plus eine Fehlermeldung unter route_error.
-    """
+def _describe_route_sync(activity_id: int) -> Any:
     run = _get(f"/my/activities/{int(activity_id)}")
     if not isinstance(run, dict):
         return run
@@ -332,6 +324,20 @@ def describe_route(activity_id: int) -> Any:
     res["activityId"] = int(activity_id)
     res["startDateTimeLocal"] = run.get("startDateTimeLocal")
     return res
+
+
+@mcp.tool()
+async def describe_route(activity_id: int) -> Any:
+    """Beschreibt die Strecke eines Laufs mit OpenStreetMap-Daten (rein lesend).
+
+    Liefert die Laufrichtung (Uhrzeigersinn oder dagegen) und die Abschnitte der Strecke mit
+    km-Bereich, Wegname, Wegtyp (Fußweg, Radweg, Straße ...), Belag (wo in OSM eingetragen),
+    Brücke und Park. Ordnet dazu die GPS-Spur per Overpass-API den OSM-Wegen zu (ein Aufruf
+    für die ganze Strecke, danach aus dem Cache). Höhen liefert OSM nicht. Ist Overpass nicht
+    erreichbar oder nach ca. 25 s nicht fertig, kommt trotzdem die Laufrichtung zurück, plus
+    eine Fehlermeldung unter route_error. timing_s zeigt, wo die Zeit hinging.
+    """
+    return await asyncio.to_thread(_describe_route_sync, activity_id)
 
 
 @mcp.tool()
