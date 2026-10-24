@@ -384,7 +384,7 @@ async def render_route_map(activity_id: int, highlight_sprints: bool = True, siz
     Start grün, Ziel rot, km-Marken als Zahlen im Kreis. Mit highlight_sprints=True werden die
     Antritte aus analyze_activity rot und nummeriert eingezeichnet; die Textantwort nennt sie
     mit Start-km, Länge und Pace. size: Kantenlänge in Pixel (400-1200, Standard 800). Das Bild
-    wird auf ca. 45 KB komprimiert (Qualität, ggf. Größe sinken), sonst kürzt der Client die Antwort.
+    wird auf ca. 24 KB komprimiert (Qualität, ggf. Größe sinken), sonst kürzt der Client die Antwort.
     Rein lesend, ein Smashrun-Aufruf. Die Kacheln werden zwischengespeichert."""
     return await asyncio.to_thread(_render_route_map_sync, activity_id, highlight_sprints, size)
 

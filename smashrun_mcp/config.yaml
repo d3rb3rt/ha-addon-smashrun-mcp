@@ -1,5 +1,5 @@
 name: "Smashrun MCP"
-version: "0.3.1"
+version: "0.3.2"
 slug: smashrun_mcp
 description: "MCP-Server für Smashrun-Laufdaten (Streamable HTTP)"
 url: "https://api.smashrun.com/v1/documentation"

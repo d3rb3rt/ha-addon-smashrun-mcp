@@ -37,10 +37,11 @@ ELEV_BATCH = 100
 ELEV_TTL_S = 365 * 24 * 3600
 ATTRIBUTION = "© OpenStreetMap-Mitwirkende"
 # Obergrenze fürs Kartenbild. Der Client kürzt Tool-Antworten ab ca. 25.000 Token; ein Bild als
-# Base64 zählt mit. 0.3.0 lieferte PNG mit ca. 0,4-1,0 MB, das kam nie an. 45 KB JPEG = ca. 60.000
-# Base64-Zeichen.
-MAX_IMAGE_BYTES = int(os.environ.get("SMASHRUN_MAX_IMAGE_BYTES", "45000"))
-JPEG_QUALITIES = (82, 72, 62, 52, 42, 34)
+# Base64 zählt mit. 0.3.0 lieferte PNG mit ca. 0,4-1,0 MB, das kam nie an. 24 KB JPEG = ca. 32.000
+# Base64-Zeichen. 0.3.1 (45 KB, 59.000 Zeichen) war im Test auf HA noch zu groß, das Limit des
+# Clients liegt darunter.
+MAX_IMAGE_BYTES = int(os.environ.get("SMASHRUN_MAX_IMAGE_BYTES", "24000"))
+JPEG_QUALITIES = (80, 70, 60, 52, 46)
 
 
 # --------------------------------------------------------------------------
