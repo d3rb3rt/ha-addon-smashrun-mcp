@@ -7,6 +7,6 @@ COPY requirements.txt /tmp/requirements.txt
 RUN pip install -r /tmp/requirements.txt
 
 WORKDIR /app
-COPY server.py analysis.py geo.py http_app.py start.py /app/
+COPY server.py analysis.py geo.py maps.py http_app.py start.py /app/
 
 CMD ["python3", "/app/start.py"]
